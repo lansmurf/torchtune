@@ -306,3 +306,144 @@ class MultiHeadAttention(nn.Module):
         # reshape the output to be the same shape as the input
         output = output.transpose(1, 2).contiguous().view(b, s_x, -1)
         return self.output_proj(output)
+
+
+
+class MultiHeadDifferentialAttention(nn.Module):
+    def __init__(
+        self,
+        *,
+        embed_dim: int,
+        num_heads: int,
+        head_dim: int,
+        q_proj: nn.Module,
+        k_proj: nn.Module,
+        v_proj: nn.Module,
+        output_proj: nn.Module,
+        pos_embeddings: Optional[nn.Module] = None,
+        kv_cache: Optional[KVCache] = None,
+        max_seq_len: int = 4096,
+        is_causal: bool = True,
+        attn_dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        
+        if embed_dim % num_heads != 0:
+            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
+
+        if attn_dropout < 0 or attn_dropout > 1:
+            raise ValueError(f"attn_dropout ({attn_dropout}) must be between 0.0 and 1.0")
+
+        self.num_heads = num_heads
+        self.embed_dim = embed_dim
+        self.attn_dropout = attn_dropout
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.is_causal = is_causal
+
+        self.kv_cache = kv_cache
+        self.q_proj = q_proj
+        self.k_proj = k_proj
+        self.v_proj = v_proj
+        self.output_proj = output_proj
+        self.pos_embeddings = pos_embeddings
+
+        # Additional projections for differential attention
+        self.q2_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.k2_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+
+        # Lambda parameters
+        self.lambda_q1 = nn.Parameter(torch.randn(head_dim))
+        self.lambda_k1 = nn.Parameter(torch.randn(head_dim))
+        self.lambda_q2 = nn.Parameter(torch.randn(head_dim))
+        self.lambda_k2 = nn.Parameter(torch.randn(head_dim))
+        self.lambda_init = self._lambda_init(num_heads)
+
+        self._attention_call = _sdpa_or_flex_attention()
+
+    def _lambda_init(self, depth):
+        return 0.8 - 0.6 * math.exp(-0.3 * depth)
+
+    def setup_cache(self, batch_size: int, dtype: torch.dtype, max_seq_len: int) -> None:
+        if self.kv_cache is not None:
+            print("Key value caches are already setup. Skipping.")
+        else:
+            self.kv_cache = KVCache(
+                batch_size=batch_size,
+                max_seq_len=max_seq_len,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                dtype=dtype,
+            )
+
+    def reset_cache(self):
+        if self.kv_cache is None:
+            raise RuntimeError("Key value caches are not setup. Call ``setup_caches()`` first.")
+        self.kv_cache.reset()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        y: Optional[torch.Tensor] = None,
+        *,
+        mask: Optional[_MaskType] = None,
+        input_pos: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        b, s_x, _ = x.shape
+        s_y = y.shape[1] if y is not None else s_x
+
+        # Compute Q1, Q2, K1, K2, V
+        q1 = self.q_proj(x)
+        q2 = self.q2_proj(x)
+        
+        if y is None:
+            if self.kv_cache is None:
+                raise ValueError("Must provide y input or use kv_cache to enable streaming decoding")
+            k1 = self.kv_cache.k_cache
+            k2 = self.kv_cache.k_cache  # Reuse k_cache for K2
+            v = self.kv_cache.v_cache
+        else:
+            k1 = self.k_proj(y)
+            k2 = self.k2_proj(y)
+            v = self.v_proj(y)
+
+        # Reshape and apply positional embeddings
+        q1 = q1.view(b, s_x, self.num_heads, self.head_dim).transpose(1, 2)
+        q2 = q2.view(b, s_x, self.num_heads, self.head_dim).transpose(1, 2)
+        k1 = k1.view(b, s_y, self.num_heads, self.head_dim).transpose(1, 2)
+        k2 = k2.view(b, s_y, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(b, s_y, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if self.pos_embeddings is not None:
+            q1 = self.pos_embeddings(q1, input_pos=input_pos)
+            q2 = self.pos_embeddings(q2, input_pos=input_pos)
+            k1 = self.pos_embeddings(k1, input_pos=input_pos)
+            k2 = self.pos_embeddings(k2, input_pos=input_pos)
+
+        # Compute lambda
+        lambda_ = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1)) - \
+                  torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2)) + \
+                  self.lambda_init
+
+        # Compute attention scores
+        attn1 = torch.matmul(q1, k1.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn2 = torch.matmul(q2, k2.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # Apply mask if provided
+        if mask is not None:
+            attn1 = attn1.masked_fill(mask == 0, float('-inf'))
+            attn2 = attn2.masked_fill(mask == 0, float('-inf'))
+
+        # Compute differential attention
+        attn1 = F.softmax(attn1, dim=-1)
+        attn2 = F.softmax(attn2, dim=-1)
+        diff_attn = attn1 - lambda_ * attn2
+
+        # Apply attention dropout
+        if self.training and self.attn_dropout > 0:
+            diff_attn = F.dropout(diff_attn, p=self.attn_dropout)
+
+        # Compute output
+        output = torch.matmul(diff_attn, v)
+        output = output.transpose(1, 2).contiguous().view(b, s_x, -1)
+        return self.output_proj(output)
